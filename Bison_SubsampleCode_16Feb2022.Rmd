@@ -1,0 +1,428 @@
+---
+title: "BisonSNPDiscoverySubsample_16Feb2022"
+author: "Rachael M Giglio"
+date: "2/16/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+wd_path<-"./"
+
+knitr::opts_knit$set(root.dir = wd_path)
+
+```
+
+## Bison Subsampling Code
+
+The following code is intended to remove related individual from DOI bison herds as well as subsample herds in a way that the subsample reflects the observed heterozygosity and PC1 scores of the full herd. An "optimal" set of individuals will be provided in which SNP data can be generated. Further, the code will identify dyads with the "optimal" set of individuals so that relatedness can be compared when using SNPs versus microsatellite loci.
+
+All input files should have the herd abbreviation in it, have a row for column names, data should be an individual per row and start on row 2, column one should consist of individual IDs, and all remaining columns should contain genotypes (2 columns per locus).
+
+The first bit of code (below) will change working directories to where the input files are stored, makes a herd ID for the herd to be analyzed (should be the same abbreviation used in the input file), loads all the necessary libraries, and upload the genotype for the specified herd:
+
+```{r herdID, echo=FALSE}
+
+herdID<-"THROs"
+
+library(related)
+library(adegenet)
+
+tempFiles<-list.files()
+
+Bgeno<-read.csv(file=tempFiles[grepl(paste0(herdID,"_GenoInput"),tempFiles)])
+colnames(Bgeno)[1]<-"ID"
+Bgeno$ID<-as.character(Bgeno$ID)
+print(paste0("Starting number of individuals = ", nrow(Bgeno)))
+print(paste0("Starting number of loci = ", (ncol(Bgeno)-1)/2))
+
+
+#Header Parameters
+relate_thres<-0.1875 #somewhere between second and third degree relatives
+SubSample_num<-35
+
+```
+
+## Filtering Data
+
+Some loci have a large amount of missing data and some, we will impose a cut-off of 75% missing data and remove loci with a genotype call rate below that cut-off. Likewise we will remove any individual with greater than 30% of their genotypes missing.
+
+```{r filter_data, echo=FALSE}
+
+#calculate call rate per locus
+lmiss<-sapply(Bgeno, function(x) sum(is.na(x))/nrow(Bgeno))
+geno_filt1<-Bgeno[,!lmiss > 0.75]
+hist(lmiss, main="Locus Filter", xlab="% missing genotypes per locus")
+
+
+# calculate the % missing data per individual
+imiss<-apply(geno_filt1, MARGIN=1,function(x) sum(is.na(x))/ncol(geno_filt1[2:ncol(geno_filt1)]))
+hist(imiss, main="Individual Filter", xlab="% missing genotypes per individual")
+
+#remove individuals with greater than 30% missing data
+geno_filt2<-geno_filt1[!imiss > 0.3,]
+
+
+print(paste0("Removed ", ((ncol(Bgeno)-1) - (ncol(geno_filt1)-1))/2," loci"))
+print(paste0("Removed ", nrow(Bgeno) - nrow(geno_filt2)," bison"))
+
+#recalculate lmiss
+#lmiss<-sapply(geno_filt2, function(x) sum(is.na(x))/nrow(geno_filt2))
+
+#write.csv(geno_filt2,file=paste0(herdName,"_filteredGeno.csv"))
+```
+
+## Calculate Relatedness of Bison 
+
+```{r relatedness, echo=FALSE}
+#load genotype data
+b_geno<-readgenotypedata(geno_filt2)
+
+#Queller and Goodnight
+b_relate<-coancestry(b_geno$gdata,quellergt=1) #this will truncate ID names if they are too long
+
+#Make pairwise relatedness matrix
+d <- b_relate$relatedness[,c("ind1.id", "ind2.id", "quellergt")]
+u <- unique(c(d$ind1.id, d$ind2.id))
+d_append <- as.data.frame(matrix(0,length(u),3))
+names(d_append) <- c("ind1.id", "ind2.id", "quellergt")
+d_append[,1:2] <- u
+d_append[,3] <- as.numeric(1)
+d <- rbind(d, d_append)
+n = length(u)
+D = matrix(0,n,n, dimnames=list(u,u))
+for(i in 1:nrow(d)){
+  j = d$ind1.id[i]
+  k = d$ind2.id[i]
+  D[j,k] = D[k,j] = as.numeric(d$quellergt[i])
+}
+
+#append herd ID to beginning in case names start with a number and make sure that names have not been truncated
+for(x in 1:nrow(D)){
+  rownames(D)[x]<-geno_filt2$ID[grepl(rownames(D)[x],geno_filt2$ID)]
+  colnames(D)[x]<-geno_filt2$ID[grepl(colnames(D)[x],geno_filt2$ID)]
+}
+
+row.names(D)<-paste0(herdID,"_",row.names(D))
+colnames(D)<-paste0(herdID,"_",colnames(D))
+
+
+
+write.csv(D,file=paste0("QG_relatedness_matrix_",herdID,".csv"),row.names=TRUE, quote = FALSE)
+
+
+```
+
+## Generate datasets of unrelated individuals by iterative pruning
+
+```{r relate_prune, echo=FALSE}
+
+######## randomly choose individuals and remove all of their relatives
+
+n_datasets<-200 #number of random datasets to make
+
+IBD<-read.csv(paste0("QG_relatedness_matrix_",herdID,".csv"), header = T, check.names=F)
+colnames(IBD)[1]<-"X"
+diag(IBD[,2:ncol(IBD)])<-NA #replace values on the diagonal (col 1 are names)
+#temp_IBD<-IBD
+
+IBD_data<-vector(mode="list",length=n_datasets)
+
+for(i in 1:n_datasets){
+  temp_IBD<-IBD
+  while(length(which(temp_IBD[,2:ncol(temp_IBD)] > relate_thres)) > 0){ 
+    #choose a random individual and remove all of their relatives
+    r_ind<-as.integer(runif(1,1,nrow(temp_IBD)))
+    
+    toremove<-temp_IBD$X[which(temp_IBD[r_ind,2:ncol(temp_IBD)] > relate_thres)]
+    if(length(toremove > 0)){
+      temp_IBD<-temp_IBD[-(which(temp_IBD[r_ind,2:ncol(temp_IBD)] > relate_thres)),]
+      temp_IBD<-temp_IBD[,!names(temp_IBD) %in% toremove]
+    }
+  }
+  IBD_data[[i]]<-temp_IBD$X
+}
+
+#only if at least 75% of the datasets had the appropriate sample size
+#were datasets with too few individuals removed 
+if(sum(lengths(IBD_data) < SubSample_num) <= round(0.75*n_datasets, digits=0)){
+
+#if there were datsets with less than 35 samples can delete them
+IBD_data<-IBD_data[lengths(IBD_data) >= SubSample_num]
+}
+
+# The following is a more static method of choosing a dataset of unrelated individuals 
+# by ranking individuals based on how many relatives they have
+# Workflow: sort the matrix with the ind with the highest ibd sum, and the most related pairs at the top
+# remove, resort, and recalculate
+
+IBD<-read.csv(paste0("QG_relatedness_matrix_",herdID,".csv"),header = T, check.names=F)
+colnames(IBD)[1]<-"X"
+
+no_inds = nrow(IBD)
+
+for(i in 1:no_inds){
+  IBD$Total<-apply(IBD[,c(2:(no_inds+1))],1,sum)
+  IBD$Count<-apply(IBD[,c(2:(no_inds+1))],1,function(i)sum(i>relate_thres))-1  
+  
+  IBD<-IBD[with(IBD,order(-Count,-Total)),]
+  prune<-as.character(IBD[1,1])
+  if(IBD[1,(no_inds+3)]<1){
+    break
+  }else{
+    IBD <- IBD[-1 , -which(colnames(IBD)==prune)]
+    no_inds = nrow(IBD)
+  }
+}
+
+#add static method to the list of datasets
+IBD_data[[length(IBD_data) + 1]]<-IBD$X 
+
+#check for duplicate datasets and remove them
+IBD_data<-lapply(IBD_data,sort,decreasing=F)
+IBD_data<-IBD_data[!duplicated(IBD_data)]
+
+#remove herd ID at the beginning of sample names
+for(x in 1:length(IBD_data)){
+  IBD_data[[x]]<-substring(IBD_data[[x]],nchar(herdID)+2)
+}
+
+print(paste0("There are ",length(IBD_data), " unique datasets of unrelated individuals"))
+
+save(IBD_data,file=paste0(herdID,"_unrelatedDataSets.RDA"))
+
+print(paste0("A total of ",length(unique(unlist(IBD_data))), " unique individuals are represented in the unrelated datasets"))
+
+
+
+```
+
+## Generate PCA and calculate observed heterozygosity
+
+```{r DiversityMetrics, echo=FALSE}
+
+geno_filt3<-as.data.frame(matrix(ncol=(ncol(geno_filt2[,2:ncol(geno_filt2)])/2),nrow=nrow(geno_filt2)))
+row.names(geno_filt3)<-geno_filt2$ID
+
+#merge every two columns into one
+#separate locus name from allele number
+locus_name<-unique(colnames(geno_filt2[,2:ncol(geno_filt2)]))
+
+if(length(locus_name) == length(2:ncol(geno_filt2))){
+  if(sum(grepl("_",locus_name)) > 0){
+  locus_name<-unique(unlist(lapply(strsplit(colnames(geno_filt2[,2:ncol(geno_filt2)]),"_"), '[[',1)))
+  }
+  
+  if(sum(grepl("[.]",locus_name)) > 0){
+  locus_name<-unique(unlist(lapply(strsplit(colnames(geno_filt2[,2:ncol(geno_filt2)]),"[.]"), '[[',1)))
+  }
+}
+
+colnames(geno_filt3)<-locus_name
+
+#to just combine columns with same locus name
+for(i in 1:length(locus_name)){
+  geno_filt3[,i]<-do.call(paste,c(geno_filt2[,grepl(locus_name[i],colnames(geno_filt2))],sep="/"))
+}
+
+b_geno<-df2genind(geno_filt3,sep="/", ploidy=2)
+pop_id<-rep(herdID,length(indNames(b_geno)))
+pop(b_geno)<-pop_id
+
+#PCA of all bison
+n_axes<-10
+obj<-tab(b_geno, freq=TRUE, NA.method="mean")
+pca.b<-dudi.pca(obj,center=TRUE,scale=FALSE,scannf=FALSE,nf=n_axes)
+pca.b
+screeplot(pca.b, main = "Screeplot - Eigenvalues")
+
+eig.perc<-round(100*pca.b$eig/sum(pca.b$eig),3)
+head(eig.perc)
+
+#calculate individual heterozygosity
+b_indHet<-(rowSums(b_geno$tab==1)/2)/(length(locNames(b_geno)))
+
+#histogram of heterozygosity
+hist(b_indHet, col=rgb(173,216,230, max=255, alpha=80, names="lt.blue"),xlab="Heterozygosity",main="")
+
+#histogram of PC1 scores
+hist(pca.b$li[,1], col=rgb(173,216,230, max=255, alpha=80, names="lt.blue"),xlab="PC1",main="")
+
+
+
+```
+
+## Subsample Unrelated Datasets
+
+```{r SubSample, echo=FALSE}
+
+#create list of subsamples (100 iterations of subsampling from each of the unrelated datasets)
+load(paste0(herdID,"_unrelatedDataSets.RDA"))
+b_subsamples<-list()
+nIterations<-100
+count<-1
+
+
+#this works because the individuals are ordered the same for pca and het matrices. tempNames will be in a different order
+#rownames of b_subsamples will retain correct ID information
+for(i in 1:length(IBD_data)){
+  if(length(IBD_data[[i]]) > 35){
+    for(x in 1:nIterations){
+      tempNames<-IBD_data[[i]][sort(sample(1:length(IBD_data[[i]]),SubSample_num,replace=F))]
+      tempPC1<-pca.b$li[which(rownames(pca.b$li) %in% tempNames), 1]
+      tempHet<-b_indHet[which(names(b_indHet) %in% tempNames)]
+      b_subsamples[[count]]<-data.frame(PC1=tempPC1,Het=tempHet)
+      
+      count<-count + 1
+    }
+  }
+  if(length(IBD_data[[i]]) <= 35){
+      tempNames<-IBD_data[[i]]
+      tempPC1<-pca.b$li[which(rownames(pca.b$li) %in% tempNames), 1]
+      tempHet<-b_indHet[which(names(b_indHet) %in% tempNames)]
+      b_subsamples[[count]]<-data.frame(PC1=tempPC1,Het=tempHet)
+      
+      count<-count + 1
+  }
+}
+
+#check for duplicate datasets and remove them
+b_subsamples<-b_subsamples[!duplicated(b_subsamples)]
+print(paste0("There are ",length(b_subsamples), " subsampled datasets"))
+save(b_subsamples,file=paste0(herdID,"_subsampled_datasets_b_subsamples.RData"))
+
+#create dataframe to store results
+b_results<-as.data.frame(matrix(nrow=length(b_subsamples), ncol=3))
+colnames(b_results)<-c("SubSample_Index","PC1_pvalue","Het_pvalue")
+
+fullData_pc1<-pca.b$li[,1]
+fullData_het<-b_indHet
+
+for(i in 1:length(b_subsamples)){
+  b_results[i,1]<-i
+  b_results[i,2]<-ks.test(b_subsamples[[i]]$PC1,fullData_pc1, exact=FALSE)$p.value
+  b_results[i,3]<-ks.test(b_subsamples[[i]]$Het,fullData_het, exact=FALSE)$p.value
+}
+
+b_results<-b_results[order(b_results$PC1_pvalue,decreasing=TRUE),]
+rank_PC1<-unique(b_results$PC1_pvalue)
+b_results$PC1_rank<-rep(-1,nrow(b_results))
+for(x in 1:length(rank_PC1)){
+  b_results$PC1_rank[which(b_results$PC1_pvalue == rank_PC1[x])]<-x
+}
+
+b_results<-b_results[order(b_results$Het_pvalue,decreasing=TRUE),]
+rank_het<-unique(b_results$Het_pvalue)
+b_results$Het_rank<-rep(-1,nrow(b_results))
+for(x in 1:length(rank_het)){
+  b_results$Het_rank[which(b_results$Het_pvalue == rank_het[x])]<-x
+}
+
+b_results$RankSum<-rowSums(b_results[,4:5])
+b_results<-b_results[order(b_results$RankSum,decreasing=F),]
+
+save(b_results,file=paste0(herdID,"_pvalueResults.RData"))
+
+
+
+```
+## Make list of IDs from Best Subsample
+```{r BestSubsample, echo=F}
+
+load(paste0(herdID,"_pvalueResults.RData"))
+load(paste0(herdID,"_subsampled_datasets_b_subsamples.RData"))
+
+
+#Get list of IDs from best subsample
+best_subsample<-as.numeric(rownames(b_results)[1])
+print(paste0("The best subsample index is ",best_subsample, " with ", nrow(b_subsamples[[best_subsample]])," individuals"))
+print(rownames(b_subsamples[[best_subsample]]))
+
+write.csv(rownames(b_subsamples[[best_subsample]]),file=paste0(herdID,"_SubSampleIDs.csv"))
+
+```
+
+
+
+## Compare Distributions of Full vs Best Subsample
+
+```{r BestSubPlots, echo=False}
+pop_id<-rep("All_Samples",length(indNames(b_geno)))
+pop_id[which(indNames(b_geno) %in% rownames(b_subsamples[[best_subsample]]))]<-"Best_Subset"
+pop(b_geno)<-pop_id
+
+col_pop<-c("darkblue","orange")
+
+s.class(pca.b$li, fac=relevel(pop(b_geno),"All_Samples"), xax=1, yax=2, col=transp(col_pop,.6), axesel=FALSE, cstar=0, cpoint=2,cellipse=0, grid=FALSE, pch=16, clabel=0)
+legend("topright", inset=.11, pch=16, legend=levels(relevel(pop(b_geno),"All_Samples")),  col=transp(col_pop,.6), cex=0.9, bty="n")
+title(xlab=paste0("PC1- ",round(eig.perc[1],2),"%"),ylab=paste0("PC2- ",round(eig.perc[2],2),"%"))
+
+s.class(pca.b$li, fac=relevel(pop(b_geno),"All_Samples"), xax=1, yax=3, col=transp(col_pop,.6), axesel=FALSE, cstar=0, cpoint=2,cellipse=0, grid=FALSE, pch=16, clabel=0)
+legend("topright", inset=.11, pch=16, legend=levels(relevel(pop(b_geno),"All_Samples")),  col=transp(col_pop,.6), cex=0.9, bty="n")
+title(xlab=paste0("PC1- ",round(eig.perc[1],2),"%"),ylab=paste0("PC3- ",round(eig.perc[3],2),"%"))
+
+
+#Remake histograms with just "best" dataset
+#calculate individual heterozygosity
+b_indHet<-(rowSums(b_geno$tab==1)/2)/(length(locNames(b_geno)))
+allHist<-hist(b_indHet)
+
+#make list of IDs of unrelated individuals
+unrelated<-rownames(b_subsamples[[best_subsample]])
+
+b_indHet_unrelate<-b_indHet[which(names(b_indHet) %in% unrelated)]
+unrelateHist<-hist(b_indHet_unrelate)
+
+#histogram of heterozygosity
+plot(allHist, col=rgb(173,216,230, max=255, alpha=80, names="lt.blue"),xlab="Heterozygosity",main="")
+plot(unrelateHist, col=rgb(255,192,203, max=255, alpha=80, names="lt.pink"),add=T)
+legend("topleft",legend=c("All","Unrelated"),fill=c(rgb(173,216,230, max=255, alpha=80, names="lt.blue"), rgb(255,192,203, max=255, alpha=80, names="lt.pink")))
+
+#histogram of PC1 scores
+PC_1unrelate<-pca.b$li[which(rownames(pca.b$li) %in% unrelated), 1]
+allHist<-hist(pca.b$li[,1])
+unrelateHist<-hist(PC_1unrelate)
+
+plot(allHist, col=rgb(173,216,230, max=255, alpha=80, names="lt.blue"),xlab="PC1",main="")
+plot(unrelateHist, col=rgb(255,192,203, max=255, alpha=80, names="lt.pink"),add=T)
+legend("topleft",legend=c("All","Unrelated"),fill=c(rgb(173,216,230, max=255, alpha=80, names="lt.blue"), rgb(255,192,203, max=255, alpha=80, names="lt.pink")))
+
+```
+
+## Make List of Related Dyads
+
+```{r RelatedDyads, echo=False}
+#reload all pairwise relatedness values for full herd
+IBD<-read.csv(paste0("QG_relatedness_matrix_",herdID,".csv"),header = T)
+
+
+#sub_IBD<-IBD[which(IBD$X %in% paste0("B_",rownames(b_subsamples[[best_subsample]]))),]
+sub_IBD<-IBD[which(IBD$X %in% paste0(herdID,"_",rownames(b_subsamples[[best_subsample]]))),]
+sub_IBD[sub_IBD == 1]<-NA
+
+#make a list of all pairwise combos over 0.3 in relatedness
+dyad_thres<-0.3
+
+b_dyad<-list()
+
+for(x in 1:nrow(sub_IBD)){
+  
+  r_dyad<-which(sub_IBD[x,2:ncol(sub_IBD)] > dyad_thres) + 1 #since we are indexing a list without the first column, will need to add 1 for subsetting
+  
+  b_dyad[[x]]<-data.frame(Unrelated_sample=rep(sub_IBD$X[x], length(r_dyad)),
+                          Relative=colnames(sub_IBD)[r_dyad],
+                          Relatedness=as.numeric(sub_IBD[x,r_dyad]))
+}
+
+b_dyad<-do.call("rbind", b_dyad)
+b_dyad<-b_dyad[order(b_dyad$Relatedness, decreasing=TRUE),]
+b_dyad$Unrelated_sample<-sapply(strsplit(b_dyad$Unrelated_sample,"_"), '[[',2)
+b_dyad$Relative<-sapply(strsplit(b_dyad$Relative,"_"), '[[',2)
+
+write.csv(b_dyad,file=paste0(herdID,"_SubSampleDyads.csv"))
+
+
+```
+
